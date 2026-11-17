@@ -73,6 +73,10 @@ class Storage:
     def lock_path(self, task_id: str) -> Path:
         return self.locks_dir / f"{task_id}.lock"
 
+    def compare_lock_path(self, baseline_id: str, review_id: str) -> Path:
+        """Serializes comparisons of one task pair across processes."""
+        return self.locks_dir / f"cmp-{baseline_id}-{review_id}.lock"
+
     def cleanup_stale_tmp(self, max_age_sec: float = 3600.0) -> None:
         """Remove orphaned temp files older than *max_age_sec*.
 

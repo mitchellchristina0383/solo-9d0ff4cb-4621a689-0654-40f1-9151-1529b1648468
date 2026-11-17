@@ -31,6 +31,12 @@
   .cell.got { background: #2e7d32; }
   .msg { white-space: pre-wrap; font-size: .88rem; margin-top: 6px; }
   .msg.err { color: #c62828; } .msg.ok { color: #2e7d32; }
+  .cmp { border: 1px solid #8884; border-radius: 8px; padding: 10px 12px; margin: 8px 0; cursor: pointer; }
+  .diff h3 { font-size: .95rem; margin: 10px 0 4px; }
+  .diff ul { margin: 2px 0 8px; padding-left: 22px; max-height: 220px; overflow: auto; }
+  .diff li { font-family: ui-monospace, monospace; font-size: .82rem; word-break: break-all; }
+  .cnt { font-weight: 700; }
+  .cnt.add { color: #2e7d32; } .cnt.del { color: #c62828; } .cnt.chg { color: #b87a10; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
   a.dl { font-weight: 600; }
 </style>
@@ -65,6 +71,25 @@
   <h2>任务列表</h2>
   <div class="row"><button id="refreshBtn">刷新</button><span class="muted">重开页面后在此查看各任务已收分块，选择同一文件即可补齐。</span></div>
   <div id="taskList"></div>
+</section>
+
+<section>
+  <h2>2. 核对两份已发布的 ZIP 诊断包</h2>
+  <p class="muted">按 ZIP 内路径比较解压后的文件内容，仅压缩方式或时间戳不同不算变化。
+  核对前会重新校验两份成品的大小与 SHA-256；遇重复路径、加密/损坏条目、单包解压超 256 MiB 或条目超 2000 个，整次核对失败且不留记录。</p>
+  <div class="row">
+    <label>基线包 <select id="baseSel"></select></label>
+    <label>复盘包 <select id="revSel"></select></label>
+    <button id="cmpBtn">开始核对</button>
+  </div>
+  <div id="cmpMsg" class="msg"></div>
+  <div id="cmpResult"></div>
+</section>
+
+<section>
+  <h2>核对记录（按任务对固定保存，重开页面仍在）</h2>
+  <div class="row"><button id="cmpRefresh">刷新</button></div>
+  <div id="cmpList"></div>
 </section>
 
 <script>
@@ -222,6 +247,8 @@ async function refreshTasks() {
   list.textContent = "加载中…";
   try {
     const { tasks } = await api("GET", "/api/tasks");
+    publishedTasks = tasks.filter(t => t.state === "published");
+    refreshCompareOptions();
     list.textContent = tasks.length ? "" : "暂无任务。";
     for (const t of tasks) {
       const card = taskCard(t);
@@ -246,6 +273,140 @@ async function refreshTasks() {
 
 $("refreshBtn").onclick = refreshTasks;
 refreshTasks();
+
+/* ------------------------------------------------ 诊断包核对 */
+let publishedTasks = [];
+
+function refreshCompareOptions() {
+  for (const [sel, ph] of [[$("baseSel"), "— 选择基线包 —"], [$("revSel"), "— 选择复盘包 —"]]) {
+    const cur = sel.value;
+    sel.textContent = "";
+    const opt0 = document.createElement("option");
+    opt0.value = ""; opt0.textContent = ph;
+    sel.appendChild(opt0);
+    for (const t of publishedTasks) {
+      const o = document.createElement("option");
+      o.value = t.task_id;
+      o.textContent = `${t.filename} · ${fmtSize(t.size)} · ${t.task_id.slice(0, 8)}`;
+      sel.appendChild(o);
+    }
+    sel.value = cur;
+  }
+}
+
+function diffList(title, cls, paths) {
+  const h = document.createElement("h3");
+  h.innerHTML = `${title} <span class="cnt ${cls}">${paths.length}</span>`;
+  const ul = document.createElement("ul");
+  for (const p of paths) {
+    const li = document.createElement("li");
+    li.textContent = p;              // ZIP 内路径不可信：一律走 textContent
+    ul.appendChild(li);
+  }
+  if (!paths.length) {
+    const li = document.createElement("li");
+    li.textContent = "（无）"; li.style.color = "#888";
+    ul.appendChild(li);
+  }
+  const wrap = document.createElement("div");
+  wrap.appendChild(h); wrap.appendChild(ul);
+  return wrap;
+}
+
+function showCompareResult(rec, note) {
+  const box = $("cmpResult");
+  box.textContent = "";
+  const head = document.createElement("div");
+  head.className = "muted";
+  head.textContent =
+    `${rec.baseline.filename} (${rec.baseline.task_id.slice(0, 8)}) → ` +
+    `${rec.review.filename} (${rec.review.task_id.slice(0, 8)}) · ` +
+    `记录 ${rec.comparison_id.slice(0, 8)} · ${rec.created_at}` +
+    (note ? ` · ${note}` : "");
+  const diff = document.createElement("div");
+  diff.className = "diff";
+  diff.appendChild(diffList("新增", "add", rec.added));
+  diff.appendChild(diffList("删除", "del", rec.deleted));
+  diff.appendChild(diffList("内容变化", "chg", rec.changed));
+  const un = document.createElement("div");
+  un.className = "muted";
+  un.textContent = `未变化文件 ${rec.unchanged_count} 个（仅压缩方式/时间戳不同不计入变化）`;
+  box.appendChild(head); box.appendChild(diff); box.appendChild(un);
+}
+
+async function runCompare() {
+  const baseline_id = $("baseSel").value, review_id = $("revSel").value;
+  const msg = $("cmpMsg");
+  msg.className = "msg"; msg.textContent = "";
+  $("cmpResult").textContent = "";
+  if (!baseline_id || !review_id) {
+    msg.className = "msg err"; msg.textContent = "请先选择基线包和复盘包。";
+    return;
+  }
+  msg.textContent = "核对中…";
+  try {
+    const rec = await api("POST", "/api/comparisons", { baseline_id, review_id });
+    msg.className = "msg ok"; msg.textContent = "核对完成，结果已固定保存。";
+    showCompareResult(rec);
+    await loadComparisons();
+  } catch (e) {
+    msg.className = "msg err";
+    const err = e.data && e.data.error;
+    msg.textContent = err
+      ? `核对失败（${err.package === "baseline" ? "基线包" : err.package === "review" ? "复盘包" : "通用"} / ${err.code}）：${err.message}`
+      : `核对失败：${e.message}`;
+  }
+}
+
+async function checkExistingPair() {
+  const baseline_id = $("baseSel").value, review_id = $("revSel").value;
+  const msg = $("cmpMsg");
+  $("cmpResult").textContent = "";
+  if (!baseline_id || !review_id) return;
+  try {
+    const rec = await api("GET",
+      `/api/comparisons/pair?baseline_id=${baseline_id}&review_id=${review_id}`);
+    msg.className = "msg"; msg.textContent = "该任务对已有核对记录：";
+    showCompareResult(rec, "已固定保存");
+  } catch (e) { /* 404 = 尚无记录，保持安静 */ }
+}
+
+async function loadComparisons() {
+  const list = $("cmpList");
+  try {
+    const { comparisons } = await api("GET", "/api/comparisons");
+    list.textContent = comparisons.length ? "" : "暂无核对记录。";
+    for (const rec of comparisons) {
+      const div = document.createElement("div");
+      div.className = "cmp";
+      const c = rec.counts;
+      div.innerHTML =
+        `<b></b> → <b></b> · ` +
+        `<span class="cnt add">+${c.added}</span> ` +
+        `<span class="cnt del">−${c.deleted}</span> ` +
+        `<span class="cnt chg">~${c.changed}</span>` +
+        `<div class="muted mono">${rec.created_at} · 记录 ${rec.comparison_id.slice(0, 8)}</div>`;
+      const bolds = div.querySelectorAll("b");
+      bolds[0].textContent = rec.baseline.filename;
+      bolds[1].textContent = rec.review.filename;
+      div.onclick = () => {
+        $("cmpMsg").className = "msg";
+        $("cmpMsg").textContent = "历史核对记录：";
+        showCompareResult(rec, "历史记录");
+        window.scrollTo({ top: $("cmpResult").offsetTop - 80, behavior: "smooth" });
+      };
+      list.appendChild(div);
+    }
+  } catch (e) {
+    list.textContent = "加载核对记录失败: " + e.message;
+  }
+}
+
+$("cmpBtn").onclick = runCompare;
+$("cmpRefresh").onclick = loadComparisons;
+$("baseSel").onchange = checkExistingPair;
+$("revSel").onchange = checkExistingPair;
+loadComparisons();
 </script>
 </body>
 </html>

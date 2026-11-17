@@ -30,6 +30,20 @@ CREATE TABLE IF NOT EXISTS chunks (
     size        INTEGER NOT NULL,
     PRIMARY KEY (task_id, chunk_index)
 );
+
+-- A finished comparison is pinned to its (baseline, review) task pair:
+-- the UNIQUE constraint guarantees that two processes comparing the same
+-- pair concurrently can only ever leave this one complete row. Failed
+-- comparisons are never recorded, so a crash mid-comparison leaves
+-- nothing behind.
+CREATE TABLE IF NOT EXISTS comparisons (
+    id            TEXT PRIMARY KEY,
+    baseline_id   TEXT NOT NULL REFERENCES tasks(id),
+    review_id     TEXT NOT NULL REFERENCES tasks(id),
+    result_json   TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    UNIQUE (baseline_id, review_id)
+);
 """
 
 

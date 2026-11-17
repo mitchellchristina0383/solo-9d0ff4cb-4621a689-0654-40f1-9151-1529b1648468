@@ -6,6 +6,13 @@ Flow:
   3. POST /api/tasks/{id}/finalize     verify chunks+size+sha256, then publish
   4. GET  /api/tasks/{id}/download     download the published package
 
+Comparison flow (both tasks must be published):
+  5. POST /api/comparisons      re-verify both artifacts against their
+                                registered size+sha256, then diff the two
+                                ZIPs by decompressed content and pin the
+                                result to the task pair
+  6. GET  /api/comparisons...   read back pinned comparison records
+
 Safety properties:
   * a chunk recorded in the DB and present on disk is immutable: re-uploading
     identical content is a no-op, different content is rejected with 409 and
@@ -14,6 +21,10 @@ Safety properties:
     published file appears only via an atomic rename after full
     size+sha256 verification, so a crash or a disk error can never publish a
     partial file and two processes can never produce two different products;
+  * a comparison is serialized per task pair with an flock and stored as a
+    single row guarded by UNIQUE(baseline_id, review_id): two processes
+    comparing the same pair leave exactly one record, and failures or
+    restarts leave no record at all (never a half-written one);
   * all state lives in SQLite (WAL) and on disk, so restarts resume cleanly
     and already published packages stay downloadable.
 """
@@ -21,6 +32,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -32,7 +44,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from . import compare as compare_mod
 from . import storage as storage_mod
+from .compare import CompareError
 from .db import connect, init_db
 from .storage import Storage
 
@@ -52,6 +66,11 @@ class CreateTask(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     size: int = Field(ge=0)
     sha256: str
+
+
+class CreateComparison(BaseModel):
+    baseline_id: str = Field(min_length=1, max_length=64)
+    review_id: str = Field(min_length=1, max_length=64)
 
 
 def _now_iso() -> str:
@@ -384,6 +403,153 @@ def create_app(data_dir=None) -> FastAPI:
                 conn.close()
         finally:
             lock_file.close()
+
+    # ------------------------------------------------------- comparisons
+    def comparison_payload(row) -> dict:
+        payload = json.loads(row["result_json"])
+        return {
+            "comparison_id": row["id"],
+            "state": "done",
+            "created_at": row["created_at"],
+            **payload,
+        }
+
+    def get_comparison_row(conn, baseline_id: str, review_id: str):
+        return conn.execute(
+            "SELECT * FROM comparisons WHERE baseline_id = ? AND review_id = ?",
+            (baseline_id, review_id),
+        ).fetchone()
+
+    @app.post("/api/comparisons", status_code=201)
+    def create_comparison(body: CreateComparison):
+        conn = connect(storage.db_path)
+        try:
+            baseline = get_task_or_404(conn, body.baseline_id)
+            review = get_task_or_404(conn, body.review_id)
+        finally:
+            conn.close()
+        for task, label in (
+            (baseline, compare_mod.BASELINE),
+            (review, compare_mod.REVIEW),
+        ):
+            if task["state"] != "published":
+                raise HTTPException(
+                    409,
+                    f"{label} package '{task['filename']}' is"
+                    f" '{task['state']}'; only published packages"
+                    " can be compared",
+                )
+
+        # Serialize comparisons of this pair across all service processes.
+        lock_file = open(
+            storage.compare_lock_path(body.baseline_id, body.review_id), "w"
+        )
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            conn = connect(storage.db_path)
+            try:
+                row = get_comparison_row(conn, body.baseline_id, body.review_id)
+                if row is not None:
+                    # Already pinned: every caller gets the same record.
+                    return JSONResponse(
+                        status_code=200, content=comparison_payload(row)
+                    )
+
+                try:
+                    for task, label in (
+                        (baseline, compare_mod.BASELINE),
+                        (review, compare_mod.REVIEW),
+                    ):
+                        compare_mod.verify_artifact(
+                            storage.published_path(task["id"]),
+                            task["size"],
+                            task["sha256"],
+                            label,
+                        )
+                    diff = compare_mod.compare_archives(
+                        storage.published_path(baseline["id"]),
+                        storage.published_path(review["id"]),
+                    )
+                except CompareError as exc:
+                    # Whole comparison fails; nothing is recorded, so a
+                    # later retry starts from a clean slate.
+                    return JSONResponse(
+                        status_code=422,
+                        content={"state": "failed", "error": exc.payload()},
+                    )
+
+                def task_brief(task):
+                    return {
+                        "task_id": task["id"],
+                        "filename": task["filename"],
+                        "size": task["size"],
+                        "sha256": task["sha256"],
+                    }
+
+                result = {
+                    "baseline": task_brief(baseline),
+                    "review": task_brief(review),
+                    **diff,
+                }
+                comparison_id = uuid.uuid4().hex
+                # INSERT OR IGNORE + re-SELECT is the backstop to the flock:
+                # even if two processes raced past it, the UNIQUE(pair)
+                # constraint admits exactly one row and both return it.
+                conn.execute(
+                    "INSERT OR IGNORE INTO comparisons"
+                    " (id, baseline_id, review_id, result_json, created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (
+                        comparison_id,
+                        baseline["id"],
+                        review["id"],
+                        json.dumps(result),
+                        _now_iso(),
+                    ),
+                )
+                row = get_comparison_row(conn, body.baseline_id, body.review_id)
+                return JSONResponse(
+                    status_code=201, content=comparison_payload(row)
+                )
+            finally:
+                conn.close()
+        finally:
+            lock_file.close()
+
+    @app.get("/api/comparisons")
+    def list_comparisons():
+        conn = connect(storage.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT * FROM comparisons ORDER BY created_at DESC"
+            ).fetchall()
+            return {"comparisons": [comparison_payload(r) for r in rows]}
+        finally:
+            conn.close()
+
+    @app.get("/api/comparisons/pair")
+    def get_comparison_by_pair(baseline_id: str, review_id: str):
+        conn = connect(storage.db_path)
+        try:
+            row = get_comparison_row(conn, baseline_id, review_id)
+            if row is None:
+                raise HTTPException(404, "no comparison recorded for this pair")
+            return comparison_payload(row)
+        finally:
+            conn.close()
+
+    @app.get("/api/comparisons/{comparison_id}")
+    def get_comparison(comparison_id: str):
+        conn = connect(storage.db_path)
+        try:
+            row = conn.execute(
+                "SELECT * FROM comparisons WHERE id = ?", (comparison_id,)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(404, "comparison not found")
+            return comparison_payload(row)
+        finally:
+            conn.close()
 
     @app.get("/api/tasks/{task_id}/download")
     def download(task_id: str):

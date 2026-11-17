@@ -1,6 +1,6 @@
 # 事故诊断包断点续传服务
 
-值班工程师接收事故诊断包的上传网页：网络断开可续传，交接时只能下载校验通过的完整文件。
+值班工程师接收事故诊断包的上传网页：网络断开可续传，交接时只能下载校验通过的完整文件；事故复盘时可在网页上核对两份已发布 ZIP 包的实际内容差异。
 
 ## 功能
 
@@ -11,6 +11,9 @@
 - 缺块可补传；摘要不符 **拒绝发布** 并提示重新创建任务
 - 多进程并发上传/提交、磁盘写失败、进程重启均不会发布残缺文件或产生两份成品
 - 已发布的包重启后仍可下载
+- **ZIP 包核对**：选择基线包与复盘包，按 ZIP 内路径比较解压后的文件内容，列出新增/删除/内容变化；仅压缩方式或时间戳不同不算变化
+- 核对前重新校验两份成品的 **登记大小与 SHA-256**；重复路径、加密/损坏条目、单包解压超 **256 MiB** 或条目超 **2000** 个 → 整次核对失败且不留任何记录
+- 成功的核对记录 **按任务对固定保存**，重开页面仍可查看；两个进程同时核对同一对任务只会留下同一份结果
 
 ## 快速开始
 
@@ -42,14 +45,29 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
 | PUT | `/api/tasks/{id}/chunks/{i}` | 上传第 i 块（1 MiB，最后一块按实际大小）。同内容重传返回 `deduplicated:true`；异内容 409 |
 | POST | `/api/tasks/{id}/finalize` | 核对分块+大小+摘要，通过则发布；缺块返回 409+`missing_chunks`；摘要不符标记 `failed` |
 | GET | `/api/tasks/{id}/download` | 下载已发布的包（未发布返回 409） |
+| POST | `/api/comparisons` | 核对 `{baseline_id, review_id}`（均须已发布）。新建返回 201；该对已有记录返回 200 与同一记录；核对失败返回 422+`error{code,message,package}` 且不留记录 |
+| GET | `/api/comparisons` | 全部核对记录（按时间倒序） |
+| GET | `/api/comparisons/pair?baseline_id=&review_id=` | 查询某任务对的核对记录（无记录 404） |
+| GET | `/api/comparisons/{id}` | 按记录 id 查询（无记录 404） |
 
 任务状态机：`uploading` → `published`（终态）/ `failed`（终态，摘要不符）。
+
+## ZIP 核对规则
+
+- 以 **ZIP 内路径** 为键比较 **解压后的文件内容**（逐条流式算 SHA-256）；压缩方式、压缩级别、时间戳差异一律忽略；目录条目不参与差异
+- 核对前先重读两份成品，核对 **登记大小 + SHA-256**，不符即失败（防磁盘静默损坏）
+- 任一包出现以下情况 → **整次核对失败**（HTTP 422，不落库、不显示部分差异）：
+  - 成品缺失/大小或摘要不符（`artifact_missing` / `integrity_mismatch`）
+  - 不是可读的 ZIP（`bad_zip`）、条目损坏或 CRC 不符（`corrupt_entry`）、不支持的压缩方式（`unsupported_compression`）
+  - 重复路径（`duplicate_path`）、加密条目（`encrypted`）
+  - 条目数 > 2000（`too_many_entries`）或解压总量 > 256 MiB（`too_large`，按声明值与实读流双重把关）
 
 ## 一致性设计
 
 - **分块幂等**：`(task_id, chunk_index)` 主键。先写临时文件 → INSERT 抢主键 → 赢者原子改名落盘；撞主键则比对内容哈希，相同去重、不同 409 保留原块。
 - **发布原子性**：成品先在临时目录完整拼装并 fsync，**校验通过后**才 `os.replace` 原子改名到 published 路径；任何时刻 published 路径要么不存在、要么是完整成品。
 - **多进程互斥**：finalize 用 per-task `flock` 串行化；SQLite WAL + busy_timeout 处理并发写。两个进程同时提交，只会有一个完成校验-改名-置态，另一个读到已发布直接返回。
+- **核对记录唯一**：核对用 per-pair `flock` 串行化，结果作为 **单条 INSERT** 落库，`UNIQUE(baseline_id, review_id)` 兜底——两个进程同时核对同一对任务只留一份记录；失败不写库，崩溃/重启不会留下半份记录（没有中间态）。
 - **崩溃恢复**：状态全在 SQLite（synchronous=FULL）与磁盘。重启后已收分块保留；DB 有记录但文件丢失的块（INSERT 后、改名前崩溃）在 finalize 时被发现并允许补传。
 - **磁盘写失败**：改名失败即回滚 DB 记录并返回 500，任务保持 `uploading`，不会产生半成品。
 
@@ -60,14 +78,15 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
 ```
 
 - `tests/test_app.py`（14 项）：完整流程、续传、幂等去重、异内容拒绝、缺块补传、摘要拒绝、磁盘失败注入（chunk 上传 / finalize 两条路径）、重启恢复、空文件、参数校验。
-- `tests/test_live.py`（3 项）：两个 uvicorn 进程并发上传/并发提交同一任务、kill -9 后重启续传、已发布包重启后可下载、跨进程同块并发去重。
+- `tests/test_compare.py`（19 项）：内容差异（增/删/改/未变）、压缩方式+时间戳差异忽略、未发布拒绝参与、成品完整性（大小/摘要/缺失）、非 ZIP、重复路径、加密条目、损坏条目、条目超限、解压量超限、目录条目忽略、空包、自身对比、记录幂等唯一、重启后记录仍在、并发同对只留一份、并发失败不留记录。
+- `tests/test_live.py`（4 项）：两个 uvicorn 进程并发上传/并发提交同一任务、kill -9 后重启续传、已发布包重启后可下载、跨进程同块并发去重、两进程并发核对同一对任务只留一份记录且失败不留痕、重启后核对记录仍在。
 
 ## 数据布局（`DATA_DIR`）
 
 ```
-uploader.db        SQLite（WAL）
+uploader.db        SQLite（WAL）：tasks / chunks / comparisons 三张表
 chunks/<task>/     已收分块
 published/<task>   校验通过后的成品（原子改名出现）
 tmp/               临时文件（启动时清理超过 1 小时的残留）
-locks/             per-task flock 文件
+locks/             per-task 与 per-pair（cmp-*）flock 文件
 ```

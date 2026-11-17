@@ -2,17 +2,21 @@
 
 Covers: concurrent chunk uploads (incl. duplicate and conflicting content),
 concurrent finalize from both processes, kill/restart mid-upload, and that
-published packages remain downloadable after restarts.
+published packages remain downloadable after restarts. Also: two processes
+comparing the same task pair concurrently leave exactly one record, a
+concurrently failing comparison leaves none, and records survive restarts.
 
 Run:  .venv/bin/python -m pytest tests/test_live.py -v
 """
 import hashlib
+import io
 import os
 import random
 import socket
 import subprocess
 import sys
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -200,3 +204,89 @@ def test_concurrent_duplicate_same_chunk_across_processes(tmp_path):
     finally:
         s1.stop()
         s2.stop()
+
+
+def make_zip(entries) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def publish(client: httpx.Client, base: str, data: bytes, filename: str) -> str:
+    r = client.post(f"{base}/api/tasks", json={
+        "filename": filename, "size": len(data), "sha256": sha256(data)})
+    assert r.status_code == 201, r.text
+    tid = r.json()["task_id"]
+    for i in range(0, len(data), CHUNK):
+        resp = client.put(f"{base}/api/tasks/{tid}/chunks/{i // CHUNK}",
+                          content=data[i:i + CHUNK])
+        assert resp.status_code == 200, resp.text
+    r = client.post(f"{base}/api/tasks/{tid}/finalize")
+    assert r.status_code == 200 and r.json()["state"] == "published", r.text
+    return tid
+
+
+def test_two_processes_concurrent_compare_single_record(tmp_path):
+    """Two processes comparing the same pair at once -> exactly one record;
+    a concurrently failing comparison -> no record at all."""
+    data_dir = tmp_path / "data"
+    s1, s2 = Server(data_dir, tmp_path), Server(data_dir, tmp_path)
+    try:
+        s1.wait_ready()
+        s2.wait_ready()
+        with httpx.Client(timeout=60) as client:
+            zb = make_zip([("a.log", b"one"), ("b.log", b"two")])
+            zr = make_zip([("a.log", b"one"), ("b.log", b"TWO"), ("c.log", b"3")])
+            junk = random.Random(21).randbytes(4096)
+            # 两个进程各发布一部分，互相可见
+            b = publish(client, s1.base, zb, "baseline.zip")
+            r = publish(client, s2.base, zr, "review.zip")
+            j = publish(client, s1.base, junk, "junk.bin")
+
+            # 同一对任务，两个进程同时核对
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures = [ex.submit(client.post, f"{base}/api/comparisons",
+                                     json={"baseline_id": b, "review_id": r})
+                           for base in (s1.base, s2.base, s1.base, s2.base)]
+                results = [f.result() for f in futures]
+            assert all(x.status_code in (200, 201) for x in results), \
+                [x.text for x in results]
+            ids = {x.json()["comparison_id"] for x in results}
+            assert len(ids) == 1  # 只留下同一份结果
+            body = results[0].json()
+            assert body["added"] == ["c.log"] and body["changed"] == ["b.log"]
+            for base in (s1.base, s2.base):
+                lst = client.get(f"{base}/api/comparisons").json()["comparisons"]
+                assert len(lst) == 1
+
+            # 同一对失败任务，两个进程同时核对：全部失败且不留任何记录
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futures = [ex.submit(client.post, f"{base}/api/comparisons",
+                                     json={"baseline_id": b, "review_id": j})
+                           for base in (s1.base, s2.base)]
+                fails = [f.result() for f in futures]
+            assert all(x.status_code == 422 for x in fails), \
+                [x.text for x in fails]
+            assert all(x.json()["error"]["code"] == "bad_zip" for x in fails)
+            for base in (s1.base, s2.base):
+                got = client.get(f"{base}/api/comparisons/pair",
+                                 params={"baseline_id": b, "review_id": j})
+                assert got.status_code == 404
+            lst = client.get(f"{s1.base}/api/comparisons").json()["comparisons"]
+            assert len(lst) == 1  # 仍只有成功那一份
+    finally:
+        s1.stop()
+        s2.stop()
+
+    # 重启后核对记录仍在
+    s3 = Server(data_dir, tmp_path)
+    try:
+        s3.wait_ready()
+        with httpx.Client(timeout=30) as client:
+            lst = client.get(f"{s3.base}/api/comparisons").json()["comparisons"]
+            assert len(lst) == 1
+            assert lst[0]["changed"] == ["b.log"]
+    finally:
+        s3.stop()
